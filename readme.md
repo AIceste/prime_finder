@@ -1,6 +1,6 @@
 This is a small program done for school which reads a file 
-describing inclusive range of numbers and output primes in 
-said range, in order.
+describing inclusive ranges of numbers and output primes in 
+said ranges, in order.
 
 It could still be enhance a bit, as per the comments. 
 

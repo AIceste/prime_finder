@@ -11,7 +11,7 @@
 #include "Chrono.hpp"
 
 constexpr int base = 10;
-constexpr size_t block_size = 1;
+constexpr size_t default_block_size_min = 1;
 
 static void pf_instance_destroy(pf_instance &instance) {
 	for (size_t i = 0; i < instance.interval_count; ++i) {
@@ -46,13 +46,18 @@ static int pf_instance_read(
 	int const argc, char const *const *const argv
 ) {
 	long thread_count;
+	long block_size_min = default_block_size_min;
 	FILE *input_file;
 	pf_interval tmp;
 
-	if (argc != 3)
+	if (argc < 3)
 		goto usage;
 	thread_count = strtol(argv[1], nullptr, base);
 	if (thread_count <= 0)
+		goto usage;
+	if (argc > 3)
+		block_size_min = strtol(argv[3], nullptr, base);
+	if (block_size_min <= 0)
 		goto usage;
 	
 	if (!(input_file = fopen(argv[2], "r")))
@@ -89,14 +94,15 @@ static int pf_instance_read(
 	fclose(input_file);
 
 	instance.thread_count = thread_count;
-	instance.block_size = block_size;
+	instance.block_size = block_size_min;
 	instance.interval_count = buf.size();
 	instance.intervals = &buf[0];
 
 	return 0;
 
 usage:
-	std::cerr << "Usage: first parameter is number of thread, second is input file." << std::endl;
+	std::cerr << "Usage: first parameter is number of thread, second is input file."
+	             " Optionally, third can be minimum group size." << std::endl;
 	goto error;
 file:
 	std::cerr << "There was an issue handling input file." << std::endl
@@ -110,17 +116,6 @@ error:
 	buf.clear();
 
 	return 1;
-}
-
-static void print_stuff(pf_interval *const intervals, size_t const count) {
-	std::cout << "INTERVALS" << std::endl;
-	for (size_t i = 0; i < count; ++i) {
-		std::cout << "[";
-		mpz_out_str(stdout, base, intervals[i].lower_bound);
-		std::cout << ",";
-		mpz_out_str(stdout, base, intervals[i].upper_bound);
-		std::cout << "]" << std::endl;
-	}
 }
 
 // Return middle-ish of the split array
@@ -187,7 +182,6 @@ static size_t pf_instance_sort_and_trim(
 	// and having less loops.. but not.
 	sort(intervals, count);
 	trim(intervals, count);
-	print_stuff(intervals, count);
 	return count;
 }
 
@@ -277,9 +271,6 @@ int main(int argc, char **argv) {
 	// given enough time.
 	pf_instance_sort_and_trim(instance, 0, instance.interval_count);
 	pf_instance_preallocate(instance);
-
-	print_stuff(instance.intervals, instance.interval_count);
-	exit(0);
 
 	mpz_t iterator;
 	size_t interval;

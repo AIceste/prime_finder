@@ -2,14 +2,16 @@
 #include <stdio.h>
 #include <iostream>
 #include <vector>
-#include <pthread.h>
 #include <assert.h>
 #include <math.h>
+
+#include <omp.h>
 
 #include "prime_finder.h"
 #include "Chrono.hpp"
 
 constexpr int base = 10;
+constexpr size_t block_size = 1;
 
 static void pf_instance_destroy(pf_instance &instance) {
 	for (size_t i = 0; i < instance.interval_count; ++i) {
@@ -86,12 +88,8 @@ static int pf_instance_read(
 	// Don't care about errors at this point.
 	fclose(input_file);
 
-	// Makes no sense to spawn lots of thread for not many entries,
-	// so it feels alright to increase block size as thread count
-	// rises. (That being said, block size is irrelevant to current
-	// implementation.)
 	instance.thread_count = thread_count;
-	instance.block_size = thread_count;
+	instance.block_size = block_size;
 	instance.interval_count = buf.size();
 	instance.intervals = &buf[0];
 
@@ -114,42 +112,47 @@ error:
 	return 1;
 }
 
+static void print_stuff(pf_interval *const intervals, size_t const count) {
+	std::cout << "INTERVALS" << std::endl;
+	for (size_t i = 0; i < count; ++i) {
+		std::cout << "[";
+		mpz_out_str(stdout, base, intervals[i].lower_bound);
+		std::cout << ",";
+		mpz_out_str(stdout, base, intervals[i].upper_bound);
+		std::cout << "]" << std::endl;
+	}
+}
+
 // Return middle-ish of the split array
 static size_t split(pf_interval *const intervals, size_t const count) {
 	pf_interval tmp;
-	size_t const split = count / 2;
+	size_t const split = count - 1;
 	size_t left = 0;
-	size_t right = count;
-	while (left < right) {
-		while (mpz_cmp(
-				intervals[left].lower_bound,
+	for (size_t j = 0; j < count; ++j) {
+		if (mpz_cmp(
+				intervals[j].lower_bound,
 				intervals[split].lower_bound
 			) < 0
 		) {
-			++left;	
-		} 
-		while (mpz_cmp(
-				intervals[--right].lower_bound,
-				intervals[split].lower_bound
-			) > 0
-		);
-		if (left >= right)
-			return right; // Which is now left
-		tmp = intervals[right];
-		intervals[right] = intervals[left];
-		intervals[left] = tmp;
+			tmp = intervals[left];
+			intervals[left++] = intervals[j];
+			intervals[j] = tmp;
+		}
 	}
-	return right;
+	tmp = intervals[left];
+	intervals[left] = intervals[split];
+	intervals[split] = tmp;
+	return left;
 }
 
-// Basically quicksort except I'm not sure I implemented it as-is or
-// if my memory failed me and I ended up doing something custom.
+// Basically quicksort
 static void sort(pf_interval *const intervals, size_t const count) {
 	if (count <= 1)
 		return;
 	size_t const center = split(intervals, count);
-	sort(intervals, center);
-	sort(intervals + center, count - center);
+	if (center)
+		sort(intervals, center);
+	sort(intervals + center + 1, count - center - 1);
 }
 
 // Works on sorted array of intervals
@@ -174,27 +177,17 @@ static void trim(pf_interval *const intervals, size_t const count) {
 static size_t pf_instance_sort_and_trim(
 	pf_instance &instance, size_t const start, size_t count
 ) {
-	// Currently is done all at once, but developped so it would be easy to
-	// progressively call it to asynchronously sort the input in a thread,
-	// one block at a time. There is a small twist forcing sort to priorise
-	// finding lowest ranges. 
 	assert(start < instance.interval_count);
 	
 	pf_interval *const intervals = instance.intervals + start;
 	if (instance.interval_count - start < count)
 		count = instance.interval_count - start;
 
-	// Get count lowest intervals in a subset of the array to be sorted.
-	// Excess work is never lost since it speeds up next sorts.
-	size_t left = 0;
-	do {
-		left += split(intervals + left, count - left) + 1;
-	} while (left < count);
-
 	// Of course, we could optimise that by merging all algorithmes
 	// and having less loops.. but not.
 	sort(intervals, count);
 	trim(intervals, count);
+	print_stuff(intervals, count);
 	return count;
 }
 
@@ -214,8 +207,10 @@ static int pf_instance_preallocate(pf_instance &instance) {
 		int const cmp = mpz_cmp(
 			intervals[i].lower_bound, intervals[i].upper_bound
 		);
-		if (cmp > 0)
+		if (cmp > 0) {
+			intervals[i].prime_count = 0;
 			continue;
+		}
 		if (cmp == 0) {
 			intervals[i].prime_count = 1;
 			++total_count;
@@ -232,7 +227,7 @@ static int pf_instance_preallocate(pf_instance &instance) {
 		// much it's worth spending the memory.
 		mpz_set(upper_count, intervals[i].upper_bound);
 		mpz_sub(upper_count, upper_count, intervals[i].lower_bound);
-		double const range_size = mpz_get_d(upper_count);		
+		double const range_size = mpz_get_d(upper_count) + 1;		
 		intervals[i].prime_count = (
 			(range_size == 2.)
 			? 1 
@@ -283,35 +278,21 @@ int main(int argc, char **argv) {
 	pf_instance_sort_and_trim(instance, 0, instance.interval_count);
 	pf_instance_preallocate(instance);
 
-	// We let that one crash if there's an issue, the system is not in
-	// a state to run anything or the user did something stupid.
-	struct thread {
-		pf_param param;
-		pthread_t thread;
-	} *const threads = (thread*)malloc(sizeof(thread) * instance.thread_count);
-	if (!threads)
-		exit(EXIT_FAILURE);
+	print_stuff(instance.intervals, instance.interval_count);
+	exit(0);
 
-	threads[0].param.thread_id = 0;
-	threads[0].param.instance = &instance;
-	for (size_t i = 1; i < instance.thread_count; ++i) {
-		threads[i].param.thread_id = i;
-		threads[i].param.instance = &instance;
-		if (pthread_create(
-				&threads[i].thread, NULL, pf_thread, (void*)(&threads[i].param)
-			)
-		)
-			goto pthread_fail;
-	};
+	mpz_t iterator;
+	size_t interval;
 
-	// Currently, main thread acts like all others.
-	pf_thread((void*)(&threads[0].param));
-
-	for (size_t i = 1; i < instance.thread_count; ++i) {
-		if (pthread_join(threads[i].thread, NULL))
-			goto pthread_fail;
-	};
-	free(threads);
+	#pragma omp parallel private(iterator, interval) shared(instance) num_threads(instance.thread_count)
+	{
+		mpz_init(iterator);
+		
+		# pragma omp for schedule(guided, instance.block_size)
+		for (interval = 0; interval < instance.interval_count; ++interval) {
+			pf_process_interval(&instance, iterator, interval);
+		}
+	}
 
 	// Stop timer here
 	duration = clock.get() - duration;
@@ -321,9 +302,5 @@ int main(int argc, char **argv) {
 
 	pf_instance_destroy(instance);
 	exit(EXIT_SUCCESS);
-
-pthread_fail:
-	std::cerr << "An issue occured while using pthread api." << std::endl;
-	exit(EXIT_FAILURE);
 }
 
